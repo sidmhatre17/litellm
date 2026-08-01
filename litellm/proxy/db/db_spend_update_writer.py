@@ -62,6 +62,11 @@ from litellm.proxy.route_llm_request import ROUTE_ENDPOINT_MAPPING
 from litellm.proxy.spend_tracking.compression_savings import (
     extract_compression_saved_tokens,
 )
+from litellm.proxy.spend_tracking.auto_router_session_queue import AutoRouterSessionQueue
+from litellm.proxy.spend_tracking.auto_router_sessions import (
+    auto_router_group_kinds,
+    turn_from_spend_payload,
+)
 from litellm.proxy.spend_tracking.savings import compute_savings_spend
 from litellm.proxy.spend_tracking.spend_log_error_logger import spend_log_error
 
@@ -97,6 +102,16 @@ def _extract_cache_creation_tokens(usage_obj: dict) -> int:
     return int(details.get("cache_write_tokens", 0) or details.get("cache_creation_tokens", 0) or 0)
 
 
+def _parse_start_time(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        verbose_proxy_logger.debug("auto_router_sessions: unparseable startTime %s", value)
+        return None
+
+
 class DBSpendUpdateWriter:
     """
     Module responsible for
@@ -120,6 +135,7 @@ class DBSpendUpdateWriter:
         self.daily_agent_spend_update_queue = DailySpendUpdateQueue()
         self.daily_org_spend_update_queue = DailySpendUpdateQueue()
         self.daily_tag_spend_update_queue = DailySpendUpdateQueue()
+        self.auto_router_session_queue = AutoRouterSessionQueue()
 
     async def update_database(
         # LiteLLM management object fields
@@ -177,6 +193,8 @@ class DBSpendUpdateWriter:
             if team_id is not None and team_id != "":
                 payload["team_id"] = team_id
 
+            await self._record_auto_router_turn(payload=payload, prisma_client=prisma_client)
+
             if disable_spend_logs is False:
                 await self._insert_spend_log_to_db(
                     payload=payload,
@@ -229,9 +247,83 @@ class DBSpendUpdateWriter:
                 end_user_id,
             )
 
-    async def _enqueue_tool_usage_transaction(
+    async def _record_auto_router_turn(
         self,
         payload: SpendLogsPayload,
+        prisma_client: PrismaClient | None,
+    ) -> None:
+        """Fold one auto-routed turn into its session rollup.
+
+        Hooked here rather than beside the daily transactions because this is the
+        one place a request passes through exactly once; the daily path runs per
+        entity type and would count every turn six times over.
+
+        Independent of ``disable_spend_logs``: the rollup is what the benchmarks
+        dashboard reads, so turning off per-request logging must not also turn off
+        the aggregate that replaced it.
+
+        Never raises. A dashboard rollup is not worth failing spend tracking over,
+        and this runs before the spend log insert, so anything escaping here would
+        cost the deployment money it could not account for.
+        """
+        try:
+            await self._record_auto_router_turn_unsafe(payload=payload, prisma_client=prisma_client)
+        except Exception as e:  # noqa: BLE001  # see docstring: this must never break the spend path
+            verbose_proxy_logger.warning("auto_router_sessions: skipped a turn (%s: %s)", type(e).__name__, e)
+
+    async def _record_auto_router_turn_unsafe(
+        self,
+        payload: SpendLogsPayload,
+        prisma_client: PrismaClient | None,
+    ) -> None:
+        from litellm.proxy.proxy_server import llm_router
+
+        session_id = payload.get("session_id")
+        model_group = payload.get("model_group")
+        model = payload.get("model")
+        start_time = payload.get("startTime")
+        if prisma_client is None or llm_router is None or not session_id or not model_group or not model:
+            return
+        router_kind = auto_router_group_kinds(llm_router).get(model_group)
+        if router_kind is None:
+            return
+        started_at = start_time if isinstance(start_time, datetime) else _parse_start_time(start_time)
+        if started_at is None:
+            return
+
+        _metadata: SpendLogsMetadata = json.loads(payload["metadata"])
+        usage_obj = _metadata.get("usage_object", {}) or {}  # mutable-ok: empty fallback for an absent usage payload
+        cache_read_tokens = _extract_cache_read_tokens(usage_obj)
+        savings_spend = compute_savings_spend(
+            model=model,
+            custom_llm_provider=payload.get("custom_llm_provider", None),
+            compression_saved_tokens=extract_compression_saved_tokens(_metadata),
+            cache_read_input_tokens=cache_read_tokens,
+            baseline_model=_metadata.get("auto_router_savings_baseline_model"),
+            usage_object=usage_obj,
+        )
+        await self.auto_router_session_queue.record_turn(
+            key=(session_id, model_group),
+            router_kind=router_kind,
+            baseline_model=_metadata.get("auto_router_savings_baseline_model"),
+            turn=turn_from_spend_payload(
+                model=model,
+                started_at=started_at,
+                prompt_tokens=payload.get("prompt_tokens", 0) or 0,
+                completion_tokens=payload.get("completion_tokens", 0) or 0,
+                total_tokens=payload.get("total_tokens", 0) or 0,
+                spend=payload.get("spend", 0.0) or 0.0,
+                autorouter_savings=savings_spend.autorouter,
+                cache_read_tokens=cache_read_tokens,
+                cache_creation_tokens=_extract_cache_creation_tokens(usage_obj),
+                usage_object=usage_obj,
+            ),
+            prisma_client=prisma_client,
+        )
+
+    async def _enqueue_tool_usage_transaction(
+        self,
+        payload: Union[dict, SpendLogsPayload],
         completion_response: "litellm.ModelResponse | Any | Exception | None",
         prisma_client: "PrismaClient | None",
         kwargs: "dict | None" = None,
@@ -353,7 +445,7 @@ class DBSpendUpdateWriter:
         end_user_id: Optional[str],
         prisma_client: Optional[PrismaClient],
         litellm_proxy_budget_name: Optional[str],
-        payload: SpendLogsPayload,
+        payload: Union[dict, SpendLogsPayload],
     ):
         """
         Runs all 11 spend-update helpers sequentially inside a single asyncio task.
@@ -782,6 +874,11 @@ class DBSpendUpdateWriter:
         else:
             - Regular flow of this method
         """
+        # Flushed outside the Redis buffer on purpose: session rollup writes are
+        # atomic increments, so two pods committing the same session compose
+        # correctly without being funnelled through a single elected writer.
+        await self.auto_router_session_queue.flush(prisma_client=prisma_client)
+
         if RedisUpdateBuffer._should_commit_spend_updates_to_redis():
             await self._commit_spend_updates_to_db_with_redis(
                 prisma_client=prisma_client,

@@ -8,6 +8,7 @@ are known) and summed into the daily tables; tokens cannot be priced after they
 have been aggregated across models.
 """
 
+from collections.abc import Mapping
 from typing import NamedTuple
 
 import litellm
@@ -156,7 +157,7 @@ def compute_autorouter_savings(
     return baseline_cost - selected_cost
 
 
-def _usage_from_spend_log(usage_object: dict | None) -> Usage | None:
+def usage_from_spend_log(usage_object: Mapping[str, object] | None) -> Usage | None:
     """Rebuild the request's ``Usage`` from the copy the spend log recorded."""
     if not usage_object:
         return None
@@ -176,7 +177,7 @@ def compute_savings_spend(
     compression_saved_tokens: int,
     cache_read_input_tokens: int,
     baseline_model: str | None = None,
-    usage_object: dict | None = None,
+    usage_object: Mapping[str, object] | None = None,
 ) -> SavingsSpend:
     """
     Dollar savings for one request, split by optimization driver.
@@ -191,7 +192,7 @@ def compute_savings_spend(
     compression = max(compression_saved_tokens, 0) * input_cost
     prompt_caching = max(cache_read_input_tokens, 0) * max(input_cost - cache_read_cost, 0.0)
 
-    usage = _usage_from_spend_log(usage_object)
+    usage = usage_from_spend_log(usage_object)
     if usage is None or not model:
         return SavingsSpend(compression=compression, prompt_caching=prompt_caching)
 
