@@ -507,6 +507,7 @@ class BaseAzureLLM(BaseOpenAILLM):
             openai_client=openai_client,
             client_initialization_params=client_initialization_params,
             client_type="azure",
+            litellm_owned_client=client is None,
         )
         return openai_client
 

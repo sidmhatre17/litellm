@@ -143,8 +143,13 @@ class BaseOpenAILLM:
         openai_client: Union[OpenAI, AsyncOpenAI, AzureOpenAI, AsyncAzureOpenAI],
         client_type: Literal["openai", "azure"],
         client_initialization_params: dict,
+        litellm_owned_client: bool = False,
     ):
-        """Stores the OpenAI client in the in-memory cache for _DEFAULT_TTL_FOR_HTTPX_CLIENTS SECONDS"""
+        """Stores the OpenAI client in the in-memory cache for _DEFAULT_TTL_FOR_HTTPX_CLIENTS SECONDS
+
+        ``litellm_owned_client`` says litellm built this client, so the cache may close it once it
+        is evicted. A client the caller supplied stays open, since litellm does not own it.
+        """
         _cache_key = BaseOpenAILLM.get_openai_client_cache_key(
             client_initialization_params=client_initialization_params,
             client_type=client_type,
@@ -153,6 +158,7 @@ class BaseOpenAILLM:
             key=_cache_key,
             value=openai_client,
             ttl=_DEFAULT_TTL_FOR_HTTPX_CLIENTS,
+            litellm_owned_client=litellm_owned_client,
         )
 
     @staticmethod

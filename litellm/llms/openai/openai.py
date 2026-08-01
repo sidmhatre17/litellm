@@ -398,6 +398,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                 openai_client=_new_client,
                 client_initialization_params=client_initialization_params,
                 client_type="openai",
+                litellm_owned_client=True,
             )
             return _new_client
 
